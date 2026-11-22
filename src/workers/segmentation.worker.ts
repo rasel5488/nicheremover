@@ -56,113 +56,19 @@ interface LoadedSession {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   model: any;
   backend: 'webgpu' | 'wasm';
-  dtype: 'fp16' | 'fp32' | 'q8';
-  preferredInputType?: 'float32' | 'float16';
+  dtype: 'q8' | 'fp32';
 }
 
 let session: LoadedSession | null = null;
 let loadingPromise: Promise<LoadedSession> | null = null;
-let workerIsMobile = false;
 
 function post(msg: unknown) {
   self.postMessage(msg);
 }
 
-/**
- * IEEE-754 float32 <-> float16 bit conversion helpers for ONNX Runtime Web `tensor(float16)` compatibility.
- */
-const f32View = new Float32Array(1);
-const u32View = new Uint32Array(f32View.buffer);
-
-function float32ToFloat16Bits(val: number): number {
-  f32View[0] = val;
-  const x = u32View[0];
-  const sign = (x >> 16) & 0x8000;
-  let exp = ((x >> 23) & 0xff) - 127 + 15;
-  let mant = x & 0x007fffff;
-
-  if (exp <= 0) {
-    if (exp < -10) return sign;
-    mant = (mant | 0x00800000) >> (1 - exp);
-    return sign | ((mant + 0x00001000) >> 13);
-  }
-  if (exp >= 0x1f) {
-    return sign | 0x7c00;
-  }
-  return sign | (exp << 10) | ((mant + 0x00001000) >> 13);
-}
-
-function float16BitsToFloat32(h: number): number {
-  const s = (h & 0x8000) >> 15;
-  const e = (h & 0x7c00) >> 10;
-  const f = h & 0x03ff;
-
-  if (e === 0) {
-    return (s ? -1 : 1) * Math.pow(2, -14) * (f / 1024);
-  }
-  if (e === 0x1f) {
-    return f ? NaN : (s ? -1 : 1) * Infinity;
-  }
-  return (s ? -1 : 1) * Math.pow(2, e - 15) * (1 + f / 1024);
-}
-
-function createInputTensor(
-  chwFloat32: Float32Array,
-  targetType: 'float32' | 'float16'
-): Tensor {
-  const dims = [1, 3, MODEL_INPUT_SIZE, MODEL_INPUT_SIZE];
-  if (targetType === 'float32') {
-    return new Tensor('float32', chwFloat32, dims);
-  }
-
-  // Build float16 tensor compatible with Transformers.js DataTypeMap.float16
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const F16Ctor = (globalThis as any).Float16Array;
-  if (typeof F16Ctor !== 'undefined') {
-    const f16 = new F16Ctor(chwFloat32.length);
-    for (let i = 0; i < chwFloat32.length; i++) {
-      f16[i] = chwFloat32[i];
-    }
-    return new Tensor('float16', f16, dims);
-  }
-
-  const u16 = new Uint16Array(chwFloat32.length);
-  for (let i = 0; i < chwFloat32.length; i++) {
-    u16[i] = float32ToFloat16Bits(chwFloat32[i]);
-  }
-  return new Tensor('float16', u16, dims);
-}
-
-async function detectWebGPU(): Promise<{ available: boolean; hasF16: boolean }> {
-  try {
-    const nav = self.navigator as Navigator & {
-      gpu?: { requestAdapter: () => Promise<{ features?: Set<string> } | null> };
-    };
-    if (!nav?.gpu) return { available: false, hasF16: false };
-    const adapter = await nav.gpu.requestAdapter();
-    if (!adapter) return { available: false, hasF16: false };
-    const hasF16 = Boolean(adapter.features?.has?.('shader-f16'));
-    return { available: true, hasF16 };
-  } catch {
-    return { available: false, hasF16: false };
-  }
-}
-
-async function disposeCurrentSession() {
-  if (!session) return;
-  try {
-    if (typeof session.model?.dispose === 'function') {
-      await session.model.dispose();
-    }
-  } catch {
-    // ignore
-  }
-  session = null;
-}
-
 async function loadModelWithStrategy(
-  backend: 'webgpu' | 'wasm',
-  dtype: 'fp16' | 'fp32' | 'q8'
+  backend: 'wasm',
+  dtype: 'q8' | 'fp32'
 ): Promise<LoadedSession> {
   const fileProgress = new Map<string, { loaded: number; total: number }>();
   let anyNetworkDownload = false;
@@ -224,31 +130,22 @@ async function loadModelWithStrategy(
   return { model, backend, dtype };
 }
 
-async function ensureModel(isMobile: boolean, forceWasm = false): Promise<LoadedSession> {
-  if (session && (!forceWasm || session.backend === 'wasm')) {
+async function ensureModel(): Promise<LoadedSession> {
+  if (session) {
     return session;
   }
-  if (loadingPromise && !forceWasm) {
+  if (loadingPromise) {
     return loadingPromise;
-  }
-  if (session && forceWasm) {
-    await disposeCurrentSession();
   }
 
   loadingPromise = (async () => {
-    const gpu = forceWasm || isMobile ? { available: false, hasF16: false } : await detectWebGPU();
-
-    const strategies: Array<{ backend: 'webgpu' | 'wasm'; dtype: 'fp16' | 'fp32' | 'q8' }> = [];
-    if (gpu.available) {
-      if (gpu.hasF16) {
-        strategies.push({ backend: 'webgpu', dtype: 'fp16' });
-      }
-      strategies.push({ backend: 'webgpu', dtype: 'fp32' });
-      strategies.push({ backend: 'wasm', dtype: 'q8' });
-    } else {
-      strategies.push({ backend: 'wasm', dtype: 'q8' });
-      strategies.push({ backend: 'wasm', dtype: 'fp32' });
-    }
+    // Use SIMD WASM with the official RMBG-1.4 q8 model (44.4 MB):
+    // - Takes standard float32 tensor(float) input with zero fp16 cast bugs
+    // - Uses ONE single model file across all desktop & mobile visits (never downloads a 2nd fallback model)
+    const strategies: Array<{ backend: 'wasm'; dtype: 'q8' | 'fp32' }> = [
+      { backend: 'wasm', dtype: 'q8' },
+      { backend: 'wasm', dtype: 'fp32' },
+    ];
 
     let lastError: unknown = null;
     for (const strat of strategies) {
@@ -351,42 +248,11 @@ async function runInference(
     chw[2 * planeSize + i] = rgba1024[p + 2] * inv255 - 0.5;
   }
 
-  // Try preferred input type first; for fp16 models automatically negotiate float16 vs float32
-  // on the SAME session so it NEVER discards the loaded 84 MB WebGPU model or downloads a 2nd model!
-  const candidateTypes: Array<'float32' | 'float16'> = currentSession.preferredInputType
-    ? [currentSession.preferredInputType]
-    : currentSession.dtype === 'fp16'
-      ? ['float16', 'float32']
-      : ['float32', 'float16'];
+  // RMBG-1.4 always expects tensor(float) [float32] input and returns float32 output
+  const inputTensor = new Tensor('float32', chw, [1, 3, MODEL_INPUT_SIZE, MODEL_INPUT_SIZE]);
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  let outputs: Record<string, any> | null = null;
-  let usedInputTensor: Tensor | null = null;
-  let lastErr: unknown = null;
-
-  for (const inputType of candidateTypes) {
-    const tensor = createInputTensor(chw, inputType);
-    try {
-      outputs = await currentSession.model({ input: tensor });
-      currentSession.preferredInputType = inputType;
-      usedInputTensor = tensor;
-      break;
-    } catch (err) {
-      lastErr = err;
-      try {
-        if (typeof (tensor as unknown as { dispose?: () => void }).dispose === 'function') {
-          (tensor as unknown as { dispose: () => void }).dispose();
-        }
-      } catch {
-        // ignore
-      }
-    }
-  }
-
-  if (!outputs) {
-    throw lastErr instanceof Error ? lastErr : new Error('Model execution failed');
-  }
-
+  const outputs: Record<string, any> = await currentSession.model({ input: inputTensor });
   const outTensor = outputs.output ?? Object.values(outputs)[0];
   if (!outTensor || !outTensor.data) {
     throw new Error('Empty segmentation output');
@@ -398,16 +264,12 @@ async function runInference(
   const raw = outTensor.data;
   const len = outW * outH;
 
-  // Decode output values (correctly converting IEEE-754 Uint16 half-floats if output tensor is float16!)
-  const isUint16HalfFloat =
-    outTensor.type === 'float16' && raw instanceof Uint16Array;
-
   const decoded = new Float32Array(len);
   let minVal = Infinity;
   let maxVal = -Infinity;
 
   for (let i = 0; i < len; i++) {
-    const v = isUint16HalfFloat ? float16BitsToFloat32(raw[i]) : Number(raw[i]);
+    const v = Number(raw[i]);
     const safeV = Number.isFinite(v) ? v : 0;
     decoded[i] = safeV;
     if (safeV < minVal) minVal = safeV;
@@ -444,11 +306,8 @@ async function runInference(
   }
 
   try {
-    if (
-      usedInputTensor &&
-      typeof (usedInputTensor as unknown as { dispose?: () => void }).dispose === 'function'
-    ) {
-      (usedInputTensor as unknown as { dispose: () => void }).dispose();
+    if (typeof (inputTensor as unknown as { dispose?: () => void }).dispose === 'function') {
+      (inputTensor as unknown as { dispose: () => void }).dispose();
     }
     for (const tensor of Object.values(outputs)) {
       if (tensor && typeof tensor.dispose === 'function') {
@@ -467,24 +326,13 @@ async function runInference(
 async function handleProcess(msg: ProcessMessage) {
   const startTime = performance.now();
   try {
-    let activeSession = await ensureModel(workerIsMobile);
+    const activeSession = await ensureModel();
 
     const { width, height, originalData, originalBlob, modelInputData } = await decodeOrientedHD(
       msg.blob
     );
 
-    let rawResult: { mask: Float32Array; width: number; height: number };
-    try {
-      rawResult = await runInference(activeSession, modelInputData);
-    } catch (err) {
-      if (activeSession.backend === 'webgpu') {
-        console.warn('[Niche Remover] WebGPU inference failed, falling back to WASM:', err);
-        activeSession = await ensureModel(workerIsMobile, true);
-        rawResult = await runInference(activeSession, modelInputData);
-      } else {
-        throw err;
-      }
-    }
+    const rawResult = await runInference(activeSession, modelInputData);
 
     const fullMask = bilinearResizeMask(
       rawResult.mask,
@@ -564,8 +412,7 @@ self.onmessage = (event: MessageEvent<WorkerInMessage>) => {
   if (!msg) return;
 
   if (msg.type === 'init') {
-    workerIsMobile = msg.isMobile;
-    void ensureModel(msg.isMobile);
+    void ensureModel();
     return;
   }
 

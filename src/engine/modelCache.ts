@@ -59,6 +59,11 @@ export function canonicalModelKey(requestOrUrl: string): string {
   return localMatch || raw;
 }
 
+function toCanonicalHttpsUrl(key: string): string {
+  if (/^https?:\/\//i.test(key)) return key;
+  return `https://huggingface.co/${key.replace(/^([^/]+\/[^/]+)\//, '$1/resolve/main/')}`;
+}
+
 export function wasFileServedFromCache(filename?: string): boolean {
   if (!filename) return recentCacheHits.size > 0;
   for (const hitKey of recentCacheHits) {
@@ -122,11 +127,14 @@ export const persistentModelCache = {
 
     // 2. Check our dedicated Cache Storage AND legacy `transformers-cache` (migrating into IndexedDB if found!)
     if (typeof caches !== 'undefined') {
+      const cacheUrl = toCanonicalHttpsUrl(key);
       const cacheNames = [CACHE_STORAGE_NAME, LEGACY_TRANSFORMERS_CACHE];
       for (const cacheName of cacheNames) {
         try {
           const c = await caches.open(cacheName);
-          const matched = (await c.match(request)) ?? (await c.match(`https://huggingface.co/${key.replace(/^([^/]+\/[^/]+)\//, '$1/resolve/main/')}`));
+          const matched =
+            (await c.match(cacheUrl)) ??
+            (/^https?:\/\//i.test(request) ? await c.match(request) : undefined);
           if (matched && matched.status === 200) {
             const bytes = await matched.arrayBuffer();
             if (bytes.byteLength > 0) {
@@ -179,11 +187,11 @@ export const persistentModelCache = {
         updatedAt: Date.now(),
       });
 
-      // Also mirror into Cache Storage for redundancy
+      // Also mirror into Cache Storage using canonical HTTPS URL for redundancy
       if (typeof caches !== 'undefined') {
         try {
           const c = await caches.open(CACHE_STORAGE_NAME);
-          await c.put(request, buildResponse(bytes, contentType));
+          await c.put(toCanonicalHttpsUrl(key), buildResponse(bytes, contentType));
         } catch {
           // ignore
         }
