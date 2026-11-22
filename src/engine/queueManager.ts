@@ -89,6 +89,8 @@ export class SegmentationQueueManager {
     this.globalBgConfig = { ...initialBgConfig };
     this.globalRetouch = { ...initialRetouch };
     this.isMobile = detectIsMobile();
+    // Pre-warm worker on startup so cached model loads silently in the background
+    this.spawnWorker();
   }
 
   public setGlobalSettings(

@@ -8,6 +8,7 @@ import {
   renderBlobsFromRGBA,
 } from '../engine/compositor';
 import { cleanupConfidenceMask } from '../engine/maskPostProcess';
+import { persistentModelCache, wasFileServedFromCache } from '../engine/modelCache';
 import { applyStudioRetouch } from '../engine/photoRetouch';
 import { compressMask, putStoredImage } from '../engine/storage';
 import {
@@ -20,9 +21,13 @@ import {
 const MODEL_ID = 'briaai/RMBG-1.4';
 const MODEL_INPUT_SIZE = 1024;
 
-// Cache model weights permanently in browser Cache Storage & enable safe WASM multithreading
+// Use our dual IndexedDB + Cache Storage persistent model cache so the model NEVER re-downloads
 env.allowLocalModels = false;
-env.useBrowserCache = true;
+env.useBrowserCache = false;
+env.useCustomCache = true;
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+env.customCache = persistentModelCache as any;
+
 if (env.backends?.onnx?.wasm) {
   const canMultiThread = typeof crossOriginIsolated !== 'undefined' && crossOriginIsolated;
   env.backends.onnx.wasm.numThreads = canMultiThread
@@ -51,7 +56,8 @@ interface LoadedSession {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   model: any;
   backend: 'webgpu' | 'wasm';
-  dtype: string;
+  dtype: 'fp16' | 'fp32' | 'q8';
+  preferredInputType?: 'float32' | 'float16';
 }
 
 let session: LoadedSession | null = null;
@@ -60,6 +66,71 @@ let workerIsMobile = false;
 
 function post(msg: unknown) {
   self.postMessage(msg);
+}
+
+/**
+ * IEEE-754 float32 <-> float16 bit conversion helpers for ONNX Runtime Web `tensor(float16)` compatibility.
+ */
+const f32View = new Float32Array(1);
+const u32View = new Uint32Array(f32View.buffer);
+
+function float32ToFloat16Bits(val: number): number {
+  f32View[0] = val;
+  const x = u32View[0];
+  const sign = (x >> 16) & 0x8000;
+  let exp = ((x >> 23) & 0xff) - 127 + 15;
+  let mant = x & 0x007fffff;
+
+  if (exp <= 0) {
+    if (exp < -10) return sign;
+    mant = (mant | 0x00800000) >> (1 - exp);
+    return sign | ((mant + 0x00001000) >> 13);
+  }
+  if (exp >= 0x1f) {
+    return sign | 0x7c00;
+  }
+  return sign | (exp << 10) | ((mant + 0x00001000) >> 13);
+}
+
+function float16BitsToFloat32(h: number): number {
+  const s = (h & 0x8000) >> 15;
+  const e = (h & 0x7c00) >> 10;
+  const f = h & 0x03ff;
+
+  if (e === 0) {
+    return (s ? -1 : 1) * Math.pow(2, -14) * (f / 1024);
+  }
+  if (e === 0x1f) {
+    return f ? NaN : (s ? -1 : 1) * Infinity;
+  }
+  return (s ? -1 : 1) * Math.pow(2, e - 15) * (1 + f / 1024);
+}
+
+function createInputTensor(
+  chwFloat32: Float32Array,
+  targetType: 'float32' | 'float16'
+): Tensor {
+  const dims = [1, 3, MODEL_INPUT_SIZE, MODEL_INPUT_SIZE];
+  if (targetType === 'float32') {
+    return new Tensor('float32', chwFloat32, dims);
+  }
+
+  // Build float16 tensor compatible with Transformers.js DataTypeMap.float16
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const F16Ctor = (globalThis as any).Float16Array;
+  if (typeof F16Ctor !== 'undefined') {
+    const f16 = new F16Ctor(chwFloat32.length);
+    for (let i = 0; i < chwFloat32.length; i++) {
+      f16[i] = chwFloat32[i];
+    }
+    return new Tensor('float16', f16, dims);
+  }
+
+  const u16 = new Uint16Array(chwFloat32.length);
+  for (let i = 0; i < chwFloat32.length; i++) {
+    u16[i] = float32ToFloat16Bits(chwFloat32[i]);
+  }
+  return new Tensor('float16', u16, dims);
 }
 
 async function detectWebGPU(): Promise<{ available: boolean; hasF16: boolean }> {
@@ -93,15 +164,8 @@ async function loadModelWithStrategy(
   backend: 'webgpu' | 'wasm',
   dtype: 'fp16' | 'fp32' | 'q8'
 ): Promise<LoadedSession> {
-  post({
-    type: 'model-status',
-    status: 'loading',
-    backend,
-    progress: 3,
-    message: 'Initializing HD engine…',
-  });
-
   const fileProgress = new Map<string, { loaded: number; total: number }>();
+  let anyNetworkDownload = false;
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const model = await AutoModel.from_pretrained(MODEL_ID, {
@@ -111,10 +175,22 @@ async function loadModelWithStrategy(
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     progress_callback: (info: any) => {
       if (!info) return;
+      const file = String(info.file || 'model');
+
+      // If this file is already in our permanent IndexedDB/Cache Storage, do NOT show a fake "Downloading MB" bar!
+      if (wasFileServedFromCache(file)) {
+        return;
+      }
+
       if (info.status === 'progress' || info.status === 'download') {
-        const key = String(info.file || 'model');
         if (typeof info.loaded === 'number' && typeof info.total === 'number' && info.total > 0) {
-          fileProgress.set(key, { loaded: info.loaded, total: info.total });
+          // Only report network download progress for actual model weights (> 1 MB)
+          if (info.total > 1024 * 1024) {
+            anyNetworkDownload = true;
+          }
+          fileProgress.set(file, { loaded: info.loaded, total: info.total });
+          if (!anyNetworkDownload) return;
+
           let sumLoaded = 0;
           let sumTotal = 0;
           for (const entry of fileProgress.values()) {
@@ -129,18 +205,10 @@ async function loadModelWithStrategy(
             status: 'loading',
             backend,
             progress: pct,
-            message: `Loading HD engine (${mbLoaded} / ${mbTotal} MB)…`,
-          });
-        } else if (typeof info.progress === 'number') {
-          post({
-            type: 'model-status',
-            status: 'loading',
-            backend,
-            progress: Math.min(99, Math.max(3, Math.round(info.progress))),
-            message: 'Loading HD engine…',
+            message: `Downloading HD engine (${mbLoaded} / ${mbTotal} MB)…`,
           });
         }
-      } else if (info.status === 'ready') {
+      } else if (info.status === 'ready' && anyNetworkDownload) {
         post({
           type: 'model-status',
           status: 'loading',
@@ -283,10 +351,42 @@ async function runInference(
     chw[2 * planeSize + i] = rgba1024[p + 2] * inv255 - 0.5;
   }
 
-  const inputTensor = new Tensor('float32', chw, [1, 3, MODEL_INPUT_SIZE, MODEL_INPUT_SIZE]);
+  // Try preferred input type first; for fp16 models automatically negotiate float16 vs float32
+  // on the SAME session so it NEVER discards the loaded 84 MB WebGPU model or downloads a 2nd model!
+  const candidateTypes: Array<'float32' | 'float16'> = currentSession.preferredInputType
+    ? [currentSession.preferredInputType]
+    : currentSession.dtype === 'fp16'
+      ? ['float16', 'float32']
+      : ['float32', 'float16'];
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const outputs: Record<string, any> = await currentSession.model({ input: inputTensor });
+  let outputs: Record<string, any> | null = null;
+  let usedInputTensor: Tensor | null = null;
+  let lastErr: unknown = null;
+
+  for (const inputType of candidateTypes) {
+    const tensor = createInputTensor(chw, inputType);
+    try {
+      outputs = await currentSession.model({ input: tensor });
+      currentSession.preferredInputType = inputType;
+      usedInputTensor = tensor;
+      break;
+    } catch (err) {
+      lastErr = err;
+      try {
+        if (typeof (tensor as unknown as { dispose?: () => void }).dispose === 'function') {
+          (tensor as unknown as { dispose: () => void }).dispose();
+        }
+      } catch {
+        // ignore
+      }
+    }
+  }
+
+  if (!outputs) {
+    throw lastErr instanceof Error ? lastErr : new Error('Model execution failed');
+  }
+
   const outTensor = outputs.output ?? Object.values(outputs)[0];
   if (!outTensor || !outTensor.data) {
     throw new Error('Empty segmentation output');
@@ -295,34 +395,60 @@ async function runInference(
   const dims: number[] = Array.isArray(outTensor.dims) ? outTensor.dims : [];
   const outH = dims.length >= 2 ? dims[dims.length - 2] : MODEL_INPUT_SIZE;
   const outW = dims.length >= 1 ? dims[dims.length - 1] : MODEL_INPUT_SIZE;
-  const raw = outTensor.data as Float32Array | Float64Array | Uint16Array | number[];
+  const raw = outTensor.data;
   const len = outW * outH;
 
+  // Decode output values (correctly converting IEEE-754 Uint16 half-floats if output tensor is float16!)
+  const isUint16HalfFloat =
+    outTensor.type === 'float16' && raw instanceof Uint16Array;
+
+  const decoded = new Float32Array(len);
   let minVal = Infinity;
   let maxVal = -Infinity;
+
   for (let i = 0; i < len; i++) {
-    const v = Number(raw[i]);
-    if (v < minVal) minVal = v;
-    if (v > maxVal) maxVal = v;
+    const v = isUint16HalfFloat ? float16BitsToFloat32(raw[i]) : Number(raw[i]);
+    const safeV = Number.isFinite(v) ? v : 0;
+    decoded[i] = safeV;
+    if (safeV < minVal) minVal = safeV;
+    if (safeV > maxVal) maxVal = safeV;
   }
 
-  const rawMask = new Float32Array(len);
+  // Apply sigmoid if raw logits
   const isLogits = minVal < -0.05 || maxVal > 1.05;
   if (isLogits) {
+    minVal = Infinity;
+    maxVal = -Infinity;
     for (let i = 0; i < len; i++) {
-      const v = Number(raw[i]);
-      rawMask[i] = 1 / (1 + Math.exp(-v));
+      const s = 1 / (1 + Math.exp(-decoded[i]));
+      decoded[i] = s;
+      if (s < minVal) minVal = s;
+      if (s > maxVal) maxVal = s;
+    }
+  }
+
+  // Official RMBG-1.4 Min-Max Normalization: stretches background floor to 0.0 and foreground peak to 1.0
+  const rawMask = new Float32Array(len);
+  const span = maxVal - minVal;
+  if (span > 1e-4) {
+    const invSpan = 1 / span;
+    for (let i = 0; i < len; i++) {
+      const v = (decoded[i] - minVal) * invSpan;
+      rawMask[i] = v <= 0 ? 0 : v >= 1 ? 1 : v;
     }
   } else {
     for (let i = 0; i < len; i++) {
-      const v = Number(raw[i]);
-      rawMask[i] = v < 0 ? 0 : v > 1 ? 1 : v;
+      const v = decoded[i];
+      rawMask[i] = v <= 0 ? 0 : v >= 1 ? 1 : v;
     }
   }
 
   try {
-    if (typeof (inputTensor as unknown as { dispose?: () => void }).dispose === 'function') {
-      (inputTensor as unknown as { dispose: () => void }).dispose();
+    if (
+      usedInputTensor &&
+      typeof (usedInputTensor as unknown as { dispose?: () => void }).dispose === 'function'
+    ) {
+      (usedInputTensor as unknown as { dispose: () => void }).dispose();
     }
     for (const tensor of Object.values(outputs)) {
       if (tensor && typeof tensor.dispose === 'function') {
@@ -333,7 +459,7 @@ async function runInference(
     // ignore
   }
 
-  // Strip faint haze & detached leftover background specks cleanly
+  // Gentle noise cleanup preserving all real foreground parts
   const cleanedMask = cleanupConfidenceMask(rawMask, outW, outH);
   return { mask: cleanedMask, width: outW, height: outH };
 }
@@ -352,7 +478,7 @@ async function handleProcess(msg: ProcessMessage) {
       rawResult = await runInference(activeSession, modelInputData);
     } catch (err) {
       if (activeSession.backend === 'webgpu') {
-        console.warn('[Niche Remover] WebGPU inference failed, retrying on WASM Q8:', err);
+        console.warn('[Niche Remover] WebGPU inference failed, falling back to WASM:', err);
         activeSession = await ensureModel(workerIsMobile, true);
         rawResult = await runInference(activeSession, modelInputData);
       } else {
@@ -368,7 +494,7 @@ async function handleProcess(msg: ProcessMessage) {
       height
     );
 
-    // Apply Studio Retouch strictly to foreground pixels
+    // Apply Studio Retouch across the image buffer so Restore Brush reveals matching retouched pixels
     const retouched = applyStudioRetouch(originalData, fullMask, width, height, msg.retouch);
 
     const blurred =

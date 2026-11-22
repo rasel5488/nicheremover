@@ -161,7 +161,7 @@ function computeSkinWeight(r: number, g: number, b: number): number {
  */
 export function applyStudioRetouch(
   original: Uint8ClampedArray,
-  mask: Float32Array,
+  _mask: Float32Array,
   width: number,
   height: number,
   retouch: RetouchConfig
@@ -203,15 +203,7 @@ export function applyStudioRetouch(
   const totalPixels = width * height;
 
   for (let i = 0, p = 0; i < totalPixels; i++, p += 4) {
-    // Skip pure background pixels completely for speed
-    if (mask[i] <= 0.01) {
-      out[p] = original[p];
-      out[p + 1] = original[p + 1];
-      out[p + 2] = original[p + 2];
-      out[p + 3] = original[p + 3];
-      continue;
-    }
-
+    // Retouch all pixels uniformly so areas revealed later with the Restore Brush match seamlessly
     const rawR = original[p];
     const rawG = original[p + 1];
     const rawB = original[p + 2];

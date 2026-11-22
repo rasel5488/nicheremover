@@ -102,7 +102,7 @@ export function TouchUpStudio({
   // Interactive studio UI state
   const [hydrating, setHydrating] = useState(false);
   const [hydratedDims, setHydratedDims] = useState<{ w: number; h: number } | null>(null);
-  const [tool, setTool] = useState<ToolMode>('pan');
+  const [tool, setTool] = useState<ToolMode>('erase');
   const [brushSize, setBrushSize] = useState(26); // 4..100 visual scale
   const [edgeRefine, setEdgeRefine] = useState(item.edgeRefine);
   const [defringe, setDefringe] = useState(item.defringe);
@@ -117,6 +117,10 @@ export function TouchUpStudio({
   bgConfigRef.current = bgConfig;
   const retouchRef = useRef(retouch);
   retouchRef.current = retouch;
+  const hasManualEditsRef = useRef(item.hasManualEdits);
+  hasManualEditsRef.current = item.hasManualEdits;
+  const onItemPersistedRef = useRef(onItemPersisted);
+  onItemPersistedRef.current = onItemPersisted;
 
   const [showOriginal, setShowOriginal] = useState(false);
   const [isFullscreen, setIsFullscreen] = useState(false);
@@ -294,18 +298,20 @@ export function TouchUpStudio({
     });
 
     const newThumbUrl = URL.createObjectURL(thumbBlob);
-    onItemPersisted(
+    const mergedManualEdits = hasManualEditsRef.current || wasBrushed;
+    hasManualEditsRef.current = mergedManualEdits;
+    onItemPersistedRef.current(
       hydrated.id,
       newThumbUrl,
       activeEdge,
       activeDefringe,
       { ...activeBg },
       { ...activeRetouch },
-      item.hasManualEdits || wasBrushed
+      mergedManualEdits
     );
     maskModifiedRef.current = false;
     return pngBlob;
-  }, [item.hasManualEdits, onItemPersisted]);
+  }, []);
 
   const schedulePersist = useCallback(() => {
     dirtyPersistRef.current = true;
@@ -313,11 +319,16 @@ export function TouchUpStudio({
       window.clearTimeout(persistTimerRef.current);
     }
     persistTimerRef.current = window.setTimeout(() => {
+      // Never block the main thread with PNG/zlib encoding while a brush stroke is in progress
+      if (strokeStateRef.current.active) {
+        schedulePersist();
+        return;
+      }
       void flushPersist();
-    }, 280);
+    }, 1600);
   }, [flushPersist]);
 
-  // Flush any pending edits if Studio unmounts (e.g. clicking Header logo or pasting more files)
+  // Flush any pending edits only when Studio unmounts
   useEffect(() => {
     return () => {
       if (dirtyPersistRef.current) {
@@ -719,6 +730,12 @@ export function TouchUpStudio({
     const hydrated = hydratedRef.current;
     if (!hydrated) return;
 
+    // Cancel any pending background persistence timer so sketching stays 60fps lag-free
+    if (persistTimerRef.current !== null) {
+      window.clearTimeout(persistTimerRef.current);
+      persistTimerRef.current = null;
+    }
+
     const pt = clientToImageCoords(e.clientX, e.clientY);
     if (!pt) return;
 
@@ -799,8 +816,11 @@ export function TouchUpStudio({
       return;
     }
 
-    // Active Pan
+    // Active Pan (only pan when zoomed in past 100% so 1x canvas never slides off-center)
     if (panStateRef.current.active && panStateRef.current.pointerId === e.pointerId) {
+      if (viewRef.current.scale <= 1.01) {
+        return;
+      }
       const dx = e.clientX - panStateRef.current.startX;
       const dy = e.clientY - panStateRef.current.startY;
       setView({
@@ -811,7 +831,7 @@ export function TouchUpStudio({
       return;
     }
 
-    // Active Brush Painting
+    // Active Brush Painting (uses coalesced pointer events when available for ultra-smooth curves)
     const st = strokeStateRef.current;
     const hydrated = hydratedRef.current;
     if (
@@ -820,35 +840,63 @@ export function TouchUpStudio({
       hydrated &&
       (effectiveTool === 'restore' || effectiveTool === 'erase')
     ) {
-      const pt = clientToImageCoords(e.clientX, e.clientY);
-      if (!pt) return;
-
+      const nativeEvt = e.nativeEvent as PointerEvent;
+      const coalesced =
+        typeof nativeEvt.getCoalescedEvents === 'function'
+          ? nativeEvt.getCoalescedEvents()
+          : null;
+      const samples = coalesced && coalesced.length > 0 ? coalesced : [nativeEvt];
       const radius = getBrushRadiusInImagePx(hydrated.width, hydrated.height, brushSize);
-      const segDirty = paintBrushSegment({
-        mask: hydrated.mask,
-        width: hydrated.width,
-        height: hydrated.height,
-        x0: st.lastImgX,
-        y0: st.lastImgY,
-        x1: pt.x,
-        y1: pt.y,
-        radius,
-        mode: effectiveTool,
-      });
 
-      st.lastImgX = pt.x;
-      st.lastImgY = pt.y;
+      let frameDirty: { x0: number; y0: number; x1: number; y1: number } | null = null;
 
-      if (segDirty) {
-        if (!st.dirty) {
-          st.dirty = { ...segDirty };
-        } else {
-          st.dirty.x0 = Math.min(st.dirty.x0, segDirty.x0);
-          st.dirty.y0 = Math.min(st.dirty.y0, segDirty.y0);
-          st.dirty.x1 = Math.max(st.dirty.x1, segDirty.x1);
-          st.dirty.y1 = Math.max(st.dirty.y1, segDirty.y1);
+      for (let i = 0; i < samples.length; i++) {
+        const pt = clientToImageCoords(samples[i].clientX, samples[i].clientY);
+        if (!pt) continue;
+
+        const segDirty = paintBrushSegment({
+          mask: hydrated.mask,
+          width: hydrated.width,
+          height: hydrated.height,
+          x0: st.lastImgX,
+          y0: st.lastImgY,
+          x1: pt.x,
+          y1: pt.y,
+          radius,
+          mode: effectiveTool,
+        });
+
+        st.lastImgX = pt.x;
+        st.lastImgY = pt.y;
+
+        if (segDirty) {
+          if (!frameDirty) {
+            frameDirty = { ...segDirty };
+          } else {
+            frameDirty.x0 = Math.min(frameDirty.x0, segDirty.x0);
+            frameDirty.y0 = Math.min(frameDirty.y0, segDirty.y0);
+            frameDirty.x1 = Math.max(frameDirty.x1, segDirty.x1);
+            frameDirty.y1 = Math.max(frameDirty.y1, segDirty.y1);
+          }
+
+          if (!st.dirty) {
+            st.dirty = { ...segDirty };
+          } else {
+            st.dirty.x0 = Math.min(st.dirty.x0, segDirty.x0);
+            st.dirty.y0 = Math.min(st.dirty.y0, segDirty.y0);
+            st.dirty.x1 = Math.max(st.dirty.x1, segDirty.x1);
+            st.dirty.y1 = Math.max(st.dirty.y1, segDirty.y1);
+          }
         }
-        renderFullComposite(edgeRefineRef.current, defringeRef.current, bgConfigRef.current, segDirty);
+      }
+
+      if (frameDirty) {
+        renderFullComposite(
+          edgeRefineRef.current,
+          defringeRef.current,
+          bgConfigRef.current,
+          frameDirty
+        );
       }
     }
   };

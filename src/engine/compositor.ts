@@ -454,11 +454,11 @@ export function paintBrushSegment(params: {
   const dx = x1 - x0;
   const dy = y1 - y0;
   const dist = Math.hypot(dx, dy);
-  const step = Math.max(1, radius * 0.22);
+  const step = Math.max(1, radius * 0.18);
   const steps = Math.max(1, Math.ceil(dist / step));
 
   const rOuter = radius;
-  const rInner = radius * 0.68;
+  const rInner = radius * 0.72;
   const rOuterSq = rOuter * rOuter;
   const rInnerSq = rInner * rInner;
   const invFalloff = 1 / Math.max(1e-5, rOuter - rInner);

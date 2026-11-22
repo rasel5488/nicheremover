@@ -20,7 +20,7 @@ export function cleanupConfidenceMask(
   // Step 1: Suppress ultra-low background haze & normalize near-1 values
   for (let i = 0; i < len; i++) {
     const v = out[i];
-    if (v < 0.035) {
+    if (v < 0.025) {
       out[i] = 0;
     } else if (v > 0.992) {
       out[i] = 1;
@@ -135,8 +135,8 @@ export function cleanupConfidenceMask(
   for (let lbl = 1; lbl <= currentLabel; lbl++) {
     const sz = compSizes[lbl];
     const pk = compPeaks[lbl];
-    // Remove tiny floating specks regardless, and remove weak medium detached background blobs
-    if (sz < tinyAbsoluteThreshold || (sz < mediumRelativeThreshold && pk < 0.88)) {
+    // Only strip weak background noise islands; never delete high-confidence subject parts (hands, hair, props)
+    if ((sz < tinyAbsoluteThreshold && pk < 0.65) || (sz < mediumRelativeThreshold && pk < 0.52)) {
       removeComp[lbl] = 1;
       hasAnyRemoved = true;
     }
