@@ -630,60 +630,49 @@ export function App() {
         />
       )}
 
-      <footer className="flex flex-col items-center justify-center gap-4 border-t border-[#1E4D37]/40 bg-[#050907] px-4 py-6">
-        <div className="google-spin-badge">
-          <div className="google-spin-badge-inner text-sm tracking-wide sm:text-base">
-            <span className="font-medium text-[#B8D2C5]">Made By</span>
-            <span className="font-bold text-[#F2F7F4]">RM Rasel Hossain</span>
-          </div>
-        </div>
-
-        {/* Direct Social & Contact Connect Bar */}
-        <div className="flex flex-wrap items-center justify-center gap-2.5 sm:gap-3">
+      <footer className="flex flex-col items-center justify-center gap-3.5 border-t border-[#1E4D37]/40 bg-[#050907] px-4 py-6">
+        {/* Top: Clean Icon-Only Social Links (Facebook, WhatsApp, Telegram) */}
+        <div className="flex items-center justify-center gap-3.5">
           <a
             href="https://www.facebook.com/rm.rasel.hossain548"
             target="_blank"
             rel="noopener noreferrer"
-            title="Connect on Facebook"
-            className="group inline-flex items-center gap-2 rounded-full border border-[#1877F2]/40 bg-[#0B1410] px-3.5 py-2 text-xs font-semibold text-[#F2F7F4] shadow-[0_4px_16px_rgba(24,119,242,0.12)] transition-all duration-200 hover:-translate-y-0.5 hover:border-[#1877F2] hover:bg-[#1877F2]/15 hover:shadow-[0_6px_22px_rgba(24,119,242,0.28)]"
+            aria-label="Facebook"
+            title="Facebook"
+            className="group flex h-10 w-10 items-center justify-center rounded-full border border-[#1877F2]/45 bg-[#0B1410] text-[#1877F2] shadow-[0_4px_16px_rgba(24,119,242,0.18)] transition-all duration-200 hover:-translate-y-0.5 hover:border-[#1877F2] hover:bg-[#1877F2] hover:text-white hover:shadow-[0_6px_22px_rgba(24,119,242,0.4)]"
           >
-            <span className="flex h-6 w-6 items-center justify-center rounded-full bg-[#1877F2] text-white transition-transform duration-200 group-hover:scale-110">
-              <FacebookIcon className="h-3.5 w-3.5" />
-            </span>
-            <span>Facebook</span>
+            <FacebookIcon className="h-5 w-5 transition-transform duration-200 group-hover:scale-110" />
           </a>
 
           <a
             href="https://wa.me/8801773622548"
             target="_blank"
             rel="noopener noreferrer"
-            title="Chat on WhatsApp (01773622548)"
-            className="group inline-flex items-center gap-2 rounded-full border border-[#25D366]/40 bg-[#0B1410] px-3.5 py-2 text-xs font-semibold text-[#F2F7F4] shadow-[0_4px_16px_rgba(37,211,102,0.12)] transition-all duration-200 hover:-translate-y-0.5 hover:border-[#25D366] hover:bg-[#25D366]/15 hover:shadow-[0_6px_22px_rgba(37,211,102,0.28)]"
+            aria-label="WhatsApp"
+            title="WhatsApp"
+            className="group flex h-10 w-10 items-center justify-center rounded-full border border-[#25D366]/45 bg-[#0B1410] text-[#25D366] shadow-[0_4px_16px_rgba(37,211,102,0.18)] transition-all duration-200 hover:-translate-y-0.5 hover:border-[#25D366] hover:bg-[#25D366] hover:text-[#050907] hover:shadow-[0_6px_22px_rgba(37,211,102,0.4)]"
           >
-            <span className="flex h-6 w-6 items-center justify-center rounded-full bg-[#25D366] text-[#050907] transition-transform duration-200 group-hover:scale-110">
-              <WhatsAppIcon className="h-3.5 w-3.5" />
-            </span>
-            <span>WhatsApp</span>
-            <span className="tabular-nums text-[#93B3A3] group-hover:text-[#F2F7F4]">
-              01773622548
-            </span>
+            <WhatsAppIcon className="h-5 w-5 transition-transform duration-200 group-hover:scale-110" />
           </a>
 
           <a
             href="https://t.me/RM_RASEL_HOSSAIN"
             target="_blank"
             rel="noopener noreferrer"
-            title="Connect on Telegram (@RM_RASEL_HOSSAIN)"
-            className="group inline-flex items-center gap-2 rounded-full border border-[#229ED9]/40 bg-[#0B1410] px-3.5 py-2 text-xs font-semibold text-[#F2F7F4] shadow-[0_4px_16px_rgba(34,158,217,0.12)] transition-all duration-200 hover:-translate-y-0.5 hover:border-[#229ED9] hover:bg-[#229ED9]/15 hover:shadow-[0_6px_22px_rgba(34,158,217,0.28)]"
+            aria-label="Telegram"
+            title="Telegram"
+            className="group flex h-10 w-10 items-center justify-center rounded-full border border-[#229ED9]/45 bg-[#0B1410] text-[#229ED9] shadow-[0_4px_16px_rgba(34,158,217,0.18)] transition-all duration-200 hover:-translate-y-0.5 hover:border-[#229ED9] hover:bg-[#229ED9] hover:text-white hover:shadow-[0_6px_22px_rgba(34,158,217,0.4)]"
           >
-            <span className="flex h-6 w-6 items-center justify-center rounded-full bg-[#229ED9] text-white transition-transform duration-200 group-hover:scale-110">
-              <TelegramIcon className="h-3.5 w-3.5" />
-            </span>
-            <span>Telegram</span>
-            <span className="text-[#93B3A3] group-hover:text-[#F2F7F4]">
-              @RM_RASEL_HOSSAIN
-            </span>
+            <TelegramIcon className="h-5 w-5 transition-transform duration-200 group-hover:scale-110" />
           </a>
+        </div>
+
+        {/* Bottom: Made By RM Rasel Hossain */}
+        <div className="google-spin-badge">
+          <div className="google-spin-badge-inner text-sm tracking-wide sm:text-base">
+            <span className="font-medium text-[#B8D2C5]">Made By</span>
+            <span className="font-bold text-[#F2F7F4]">RM Rasel Hossain</span>
+          </div>
         </div>
       </footer>
 
